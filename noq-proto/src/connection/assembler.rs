@@ -192,8 +192,9 @@ impl Assembler {
     /// Must follow `defragment`, which leaves the chunks in order and without overlap. Discards
     /// nothing and never bridges a hole: only chunks that touch are joined, and a run of one
     /// chunk keeps its buffer. `buffered`, `allocated`, `end`, `bytes_read` and the set of
-    /// received offsets of unordered reads are unchanged. A chunk may start below `bytes_read`,
-    /// as it may after `defragment(0)`; the joined chunk keeps those bytes for `read` to trim.
+    /// received offsets of unordered reads are unchanged. In unordered mode a chunk may start below
+    /// `bytes_read`, which counts bytes and is no stream position; the joined chunk keeps those
+    /// bytes, as they are unread.
     fn join_contiguous(&mut self) {
         debug_assert!(
             self.data
@@ -300,7 +301,15 @@ impl Assembler {
         let threshold = 32768.max(buffered * 3 / 2);
         // Small gapped frames hold over-allocation below the threshold, so bound the count too.
         if over_allocation > threshold || self.data.len() > COMPACT_THRESHOLD {
-            self.defragment(0);
+            // In ordered mode `bytes_read` is the end of the delivered prefix, so compaction drops
+            // what lies below it, such as a duplicate that the reader has read past. In unordered
+            // mode it counts bytes and no stream position, and unread data can lie below it.
+            let start = if self.state.is_ordered() {
+                self.bytes_read
+            } else {
+                0
+            };
+            self.defragment(start);
             // ngtcp2 uses a threshold of 4000 -- try to be a little more conservative?
             if self.data.len() > MAX_CHUNKS {
                 // Chunks that touch are not gaps. Only what is still above the bound once they
@@ -1467,9 +1476,9 @@ mod test {
     }
 
     /// An overlapping frame that arrived first leaves a chunk that starts below the read
-    /// position after a partial read. A join folds it into a run.
+    /// position after a partial read. The compaction before the join cuts it at the read position.
     #[test]
-    fn join_with_a_chunk_below_the_read_position() {
+    fn compaction_cuts_a_chunk_below_the_read_position_before_a_join() {
         let pattern = [604, 104, 104];
         let frames = 2400;
         let stream = stream_prefix(600 + pattern_len(&pattern, frames));
@@ -1486,8 +1495,81 @@ mod test {
         let mut offset = 600;
         insert_pattern(&mut x, &mut offset, &pattern, 0..frames);
         assert!(x.stats.joins > 0, "the join did not run");
-        assert!(x.data.front().unwrap().offset < x.bytes_read());
+        // The compaction before the join cut the chunk at the read position
+        assert!(x.data.front().unwrap().offset >= x.bytes_read());
         drain_varied(&mut x, true, &stream, &mut delivered);
+        assert!(delivered.iter().all(|d| *d), "not every byte was delivered");
+    }
+
+    /// The peer sends the head of a large unread chunk again, and the reader reads past the
+    /// duplicate and then stops reading. The duplicate lies below the read position, so the next
+    /// compaction drops it, and it does not make every later insert compact.
+    #[test]
+    fn dead_duplicates_do_not_keep_compacting() {
+        const FRONT: usize = 400_000;
+        const SMALL: usize = 100;
+        const INSERTS: usize = 200;
+
+        /// The number of the inserts after the read that compact, with every byte read back
+        fn compactions(duplicates: usize) -> usize {
+            let stream = stream_prefix(FRONT + INSERTS * SMALL);
+            let mut delivered = vec![false; stream.len()];
+            let mut x = Assembler::new();
+            x.insert(0, frame(0, FRONT), FRONT).unwrap();
+            if duplicates > 0 {
+                x.insert(0, frame(0, duplicates), duplicates).unwrap();
+            }
+            // The reader takes all but 10,000 bytes of the front chunk and stops reading
+            assert!(read_once(
+                &mut x,
+                FRONT - 10_000,
+                true,
+                &stream,
+                &mut delivered
+            ));
+            // Each packet has spare bytes, so `allocated` stays above `buffered` unless the
+            // insert compacted, which sets them equal
+            let mut compacted = 0;
+            for i in 0..INSERTS {
+                let at = (FRONT + i * SMALL) as u64;
+                x.insert(at, frame(at, SMALL), 2 * SMALL).unwrap();
+                compacted += (x.allocated == x.buffered) as usize;
+            }
+            drain_varied(&mut x, true, &stream, &mut delivered);
+            assert!(delivered.iter().all(|d| *d), "not every byte was delivered");
+            assert_eq!(x.bytes_read(), stream.len() as u64);
+            compacted
+        }
+
+        // The first insert compacts in every run: the read left the allocation of the front
+        // chunk behind 10,000 bytes
+        for duplicates in [0, 20_000, 100_000] {
+            assert_eq!(
+                compactions(duplicates),
+                1,
+                "{duplicates} bytes of duplicates below the read position"
+            );
+        }
+    }
+
+    /// Duplicates lie below the read position, the reader moves to unordered reads, and a frame
+    /// that comes late lies below the read count. The compaction that follows keeps it.
+    #[test]
+    fn dead_duplicates_then_unordered_reads_keep_a_late_frame() {
+        let stream = stream_prefix(400_000);
+        let mut delivered = vec![false; stream.len()];
+        let mut x = Assembler::new();
+        x.insert(0, frame(0, 300_000), 300_000).unwrap();
+        x.insert(0, frame(0, 100_000), 100_000).unwrap();
+        x.insert(310_000, frame(310_000, 90_000), 90_000).unwrap();
+        assert!(read_once(&mut x, 300_000, true, &stream, &mut delivered));
+        x.ensure_ordering(false).unwrap();
+        assert!(read_once(&mut x, 90_000, false, &stream, &mut delivered));
+        assert_eq!(x.bytes_read(), 390_000);
+        // The late frame is unread, below the count. Its packet is large, so this compacts.
+        x.insert(300_000, frame(300_000, 10_000), 200_000).unwrap();
+        assert_eq!(x.allocated, x.buffered, "the insert did not compact");
+        drain_varied(&mut x, false, &stream, &mut delivered);
         assert!(delivered.iter().all(|d| *d), "not every byte was delivered");
     }
 
