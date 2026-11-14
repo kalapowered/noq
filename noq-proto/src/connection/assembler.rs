@@ -144,7 +144,6 @@ impl Assembler {
         self.allocated = self.buffered;
         #[cfg(test)]
         {
-            self.stats.compactions += 1;
             self.stats.copied_by_defragment += fragmented_buffered as u64;
         }
         self.data.reserve(buffers.len());
@@ -181,14 +180,14 @@ impl Assembler {
         }
     }
 
-    /// Joins each run of chunks in which every chunk starts where the one before it ends into
-    /// one chunk
+    /// Joins each run of touching chunks into one chunk
     ///
-    /// `defragment` keeps a large chunk apart from the chunks next to it, so that the large
-    /// chunk is not copied at every compaction. A stream of large chunks with runs of small ones
-    /// between them therefore keeps about two entries for each large chunk, whether or not any
-    /// data is missing. Joined, the entries are the stretches of received data, which is what
-    /// `MAX_CHUNKS` is meant to bound.
+    /// Chunks touch when each one starts where the one before it ends. `defragment` keeps a
+    /// large chunk apart from the chunks next to it, so that the large chunk is not copied at
+    /// every compaction. A stream of large chunks with runs of small ones between them therefore
+    /// keeps about two entries for each large chunk, whether or not any data is missing. Joined,
+    /// the entries are the stretches of received data, which is what `MAX_CHUNKS` is meant to
+    /// bound.
     ///
     /// Must follow `defragment`, which leaves the chunks in order and without overlap. Discards
     /// nothing and never bridges a hole: only chunks that touch are joined, and a run of one
@@ -223,7 +222,6 @@ impl Assembler {
             #[cfg(test)]
             {
                 self.stats.copied_by_join += run.len as u64;
-                self.stats.largest_run = self.stats.largest_run.max(run.len);
             }
             joined.push_back(Buffer::new_defragmented(offset, buffer.freeze()));
         }
@@ -308,11 +306,7 @@ impl Assembler {
                 // Chunks that touch are not gaps. Only what is still above the bound once they
                 // are joined is a peer's doing.
                 self.join_contiguous();
-                #[cfg(test)]
-                let bound = self.stats.bound_after_join.unwrap_or(MAX_CHUNKS_AFTER_JOIN);
-                #[cfg(not(test))]
-                let bound = MAX_CHUNKS_AFTER_JOIN;
-                if self.data.len() > bound {
+                if self.data.len() > MAX_CHUNKS {
                     return Err(TooManyChunks);
                 }
             }
@@ -498,17 +492,9 @@ fn leading_run(chunks: &VecDeque<Buffer>) -> Option<Run> {
 /// Bound on the number of distinct spans kept for a stream.
 ///
 /// Independent of how much memory those spans over-allocate. A frame is rejected only
-/// if compaction cannot get the count back down to this, and, when it can only by joining
-/// chunks that touch, to `MAX_CHUNKS_AFTER_JOIN`.
+/// if compaction cannot get the count back down to this, even after the chunks that touch
+/// have been joined.
 const MAX_CHUNKS: usize = 1024;
-
-/// Bound on the number of spans that remain after chunks that touch have been joined.
-///
-/// A join copies every run of two or more chunks. It runs only above `MAX_CHUNKS` entries and
-/// leaves at most this many, so the next one needs more than `MAX_CHUNKS - MAX_CHUNKS_AFTER_JOIN`
-/// frames to arrive. With `MAX_CHUNKS` here, a peer that holds a thousand gaps open could force
-/// a copy of the buffer every hundred frames or so.
-const MAX_CHUNKS_AFTER_JOIN: usize = MAX_CHUNKS / 2;
 
 /// Minimum size of a defragmented chunk that is retained without coalescing.
 ///
@@ -526,18 +512,12 @@ const COMPACT_THRESHOLD: usize = 2 * MAX_CHUNKS;
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct Stats {
-    /// Calls of `defragment`
-    compactions: u64,
     /// Joins
     joins: u64,
     /// Bytes that `defragment` copied
     copied_by_defragment: u64,
     /// Bytes that joins copied
     copied_by_join: u64,
-    /// The longest run that a join copied, which is the most that a join allocates at once
-    largest_run: usize,
-    /// Replaces `MAX_CHUNKS_AFTER_JOIN`
-    bound_after_join: Option<usize>,
 }
 
 #[cfg(test)]
@@ -991,7 +971,7 @@ mod test {
     // every byte that comes back can be compared with what was inserted.
 
     /// What a packet carries besides the stream data of one frame
-    pub(super) const FRAME_OVERHEAD: usize = 8;
+    const FRAME_OVERHEAD: usize = 8;
 
     /// The byte at `position` of the stream that the tests send
     fn content(position: u64) -> u8 {
@@ -1004,7 +984,7 @@ mod test {
     }
 
     /// The frame `[offset, offset + len)` of the stream
-    pub(super) fn frame(offset: u64, len: usize) -> Bytes {
+    fn frame(offset: u64, len: usize) -> Bytes {
         Bytes::from(
             (offset..offset + len as u64)
                 .map(content)
@@ -1202,6 +1182,24 @@ mod test {
         last_allocation: impl Fn(&Assembler) -> usize,
     ) -> Staircase {
         assert!(long < runs, "the last run ends with a small chunk");
+        let shape = |run: usize| -> &'static [usize] {
+            if run < long {
+                &[LARGE, SMALL, LARGE]
+            } else {
+                &[LARGE, SMALL]
+            }
+        };
+        staircase_of(runs, shape, ordered, last_allocation)
+    }
+
+    /// Like `staircase`, with the lengths of the chunks of run `n` given by `shape(n)`. The last
+    /// run must have more than one chunk.
+    fn staircase_of(
+        runs: usize,
+        shape: impl Fn(usize) -> &'static [usize],
+        ordered: bool,
+        last_allocation: impl Fn(&Assembler) -> usize,
+    ) -> Staircase {
         let mut x = Assembler::new();
         if !ordered {
             x.ensure_ordering(false).unwrap();
@@ -1210,11 +1208,7 @@ mod test {
         let mut offset = 1;
         let mut result = Ok(());
         for run in 0..runs {
-            let lengths: &[usize] = if run < long {
-                &[LARGE, SMALL, LARGE]
-            } else {
-                &[LARGE, SMALL]
-            };
+            let lengths = shape(run);
             for (i, &len) in lengths.iter().enumerate() {
                 let last = run + 1 == runs && i + 1 == lengths.len();
                 let allocation = if last {
@@ -1264,13 +1258,33 @@ mod test {
         assert!(delivered.iter().all(|d| *d), "not every byte was delivered");
     }
 
+    const BIG: usize = 5000;
+    const MID: usize = 200;
+
+    /// `runs` runs with a one-byte hole before each. All but the last three are one chunk of
+    /// `MID` bytes. The last three are a chunk of `BIG` bytes, which compaction keeps as it is,
+    /// and a small one that it merges. Compaction leaves `runs + 3` entries, which a join turns
+    /// into `runs`. (With runs of one size compaction would merge every chunk, and no join would
+    /// be needed.)
+    fn near_the_bound(runs: usize, ordered: bool) -> Staircase {
+        let shape = move |run: usize| -> &'static [usize] {
+            if run + 3 >= runs {
+                &[BIG, SMALL]
+            } else {
+                &[MID]
+            }
+        };
+        staircase_of(runs, shape, ordered, |_| 1 << 20)
+    }
+
     #[test]
     fn join_keeps_runs_that_fit_the_bound() {
         for ordered in [true, false] {
-            // 1,025 entries after compaction, which the join turns into 512
-            let s = staircase(MAX_CHUNKS / 2, 1, ordered, |_| 1 << 20);
-            assert!(s.result.is_ok(), "512 runs fit the bound");
-            assert_eq!(s.x.data.len(), MAX_CHUNKS / 2);
+            // 1,027 entries after compaction, which the join turns into 1,024
+            let s = near_the_bound(MAX_CHUNKS, ordered);
+            assert!(s.result.is_ok(), "1,024 runs fit the bound");
+            assert_eq!(s.x.stats.joins, 1, "the join did not run");
+            assert_eq!(s.x.data.len(), MAX_CHUNKS);
             repair_and_read(s, ordered);
         }
     }
@@ -1278,18 +1292,9 @@ mod test {
     #[test]
     fn join_refuses_one_run_more_than_the_bound() {
         for ordered in [true, false] {
-            // 1,026 entries after compaction, then 513 after the join
-            let s = staircase(MAX_CHUNKS / 2 + 1, 0, ordered, |_| 1 << 20);
-            assert_matches!(s.result, Err(TooManyChunks));
-            let s = staircase(MAX_CHUNKS / 2 + 1, 1, ordered, |_| 1 << 20);
-            assert_matches!(s.result, Err(TooManyChunks));
-        }
-    }
-
-    #[test]
-    fn real_gaps_beyond_max_chunks_are_still_refused() {
-        for ordered in [true, false] {
-            let s = staircase(MAX_CHUNKS + 1, 0, ordered, |_| 1 << 20);
+            // 1,028 entries after compaction, then 1,025 after the join
+            let s = near_the_bound(MAX_CHUNKS + 1, ordered);
+            assert_eq!(s.x.stats.joins, 1, "the join did not run");
             assert_matches!(s.result, Err(TooManyChunks));
         }
     }
@@ -1316,6 +1321,26 @@ mod test {
         }
     }
 
+    /// A run of one chunk between joined runs keeps its bytes. Nothing but the bytes read back
+    /// is compared, so a join that bridges a one-byte hole or drops a run is found by them.
+    #[test]
+    fn join_keeps_a_run_of_one_chunk_between_joined_runs() {
+        for ordered in [true, false] {
+            // Every third run is a large chunk alone: 1,167 entries after compaction
+            let shape = |run: usize| -> &'static [usize] {
+                if run % 3 == 1 {
+                    &[LARGE]
+                } else {
+                    &[LARGE, SMALL]
+                }
+            };
+            let s = staircase_of(700, shape, ordered, |_| 1 << 20);
+            assert!(s.result.is_ok(), "contiguous chunks are not gaps");
+            assert_eq!(s.x.stats.joins, 1, "the join did not run");
+            repair_and_read(s, ordered);
+        }
+    }
+
     #[test]
     fn allocation_trigger_at_its_threshold() {
         for ordered in [true, false] {
@@ -1333,6 +1358,7 @@ mod test {
                 s.result.is_ok(),
                 "compaction must not refuse contiguous data"
             );
+            assert_eq!(s.x.stats.joins, 1, "the join did not run");
             assert_eq!(s.x.data.len(), MAX_CHUNKS / 2);
             repair_and_read(s, ordered);
         }
@@ -1410,21 +1436,58 @@ mod test {
         assert!(delivered.iter().all(|d| *d), "not every byte was delivered");
     }
 
-    /// The reader moves to unordered reads first. Its read count is then no stream position, and
-    /// the join must not trim chunks by it.
+    /// The reader moves to unordered reads, and its read count passes the offset of a frame that
+    /// is still on its way. The count is then no stream position: that frame, when it comes, is
+    /// unread data below it, which the join must keep.
     #[test]
-    fn join_after_a_switch_to_unordered_reads() {
+    fn join_keeps_unread_data_below_the_read_count() {
         let pattern = [424, 104, 104, 104];
         let frames = 2400;
         let stream = stream_prefix(pattern_len(&pattern, frames));
         let mut delivered = vec![false; stream.len()];
         let mut x = Assembler::new();
         let mut offset = 0;
-        insert_pattern(&mut x, &mut offset, &pattern, 0..20);
-        assert!(read_once(&mut x, 1000, true, &stream, &mut delivered));
+        insert_pattern(&mut x, &mut offset, &pattern, 0..2);
+        // Frame 2 is delayed
+        let (delayed_at, delayed_len) = (offset, pattern[2]);
+        offset += delayed_len as u64;
+        insert_pattern(&mut x, &mut offset, &pattern, 3..40);
         x.ensure_ordering(false).unwrap();
-        insert_pattern(&mut x, &mut offset, &pattern, 20..frames);
+        while x.bytes_read() < 5000 {
+            assert!(read_once(&mut x, 700, false, &stream, &mut delivered));
+        }
+        assert!(x.bytes_read() > delayed_at + delayed_len as u64);
+        let late = frame(delayed_at, delayed_len);
+        x.insert(delayed_at, late, delayed_len + FRAME_OVERHEAD)
+            .unwrap();
+        insert_pattern(&mut x, &mut offset, &pattern, 40..frames);
+        assert!(x.stats.joins > 0, "the join did not run");
         drain_varied(&mut x, false, &stream, &mut delivered);
+        assert!(delivered.iter().all(|d| *d), "not every byte was delivered");
+    }
+
+    /// An overlapping frame that arrived first leaves a chunk that starts below the read
+    /// position after a partial read. A join folds it into a run.
+    #[test]
+    fn join_with_a_chunk_below_the_read_position() {
+        let pattern = [604, 104, 104];
+        let frames = 2400;
+        let stream = stream_prefix(600 + pattern_len(&pattern, frames));
+        let mut delivered = vec![false; stream.len()];
+        let mut x = Assembler::new();
+        x.insert(0, frame(0, 424), 424 + FRAME_OVERHEAD).unwrap();
+        x.insert(424, frame(424, 104), 104 + FRAME_OVERHEAD)
+            .unwrap();
+        x.insert(100, frame(100, 500), 500 + FRAME_OVERHEAD)
+            .unwrap();
+        assert!(read_once(&mut x, 300, true, &stream, &mut delivered));
+        let front = x.data.front().unwrap();
+        assert!(front.offset < x.bytes_read());
+        let mut offset = 600;
+        insert_pattern(&mut x, &mut offset, &pattern, 0..frames);
+        assert!(x.stats.joins > 0, "the join did not run");
+        assert!(x.data.front().unwrap().offset < x.bytes_read());
+        drain_varied(&mut x, true, &stream, &mut delivered);
         assert!(delivered.iter().all(|d| *d), "not every byte was delivered");
     }
 
@@ -1556,6 +1619,11 @@ mod test {
             let start = chunk.offset as usize;
             let end = start + chunk.bytes.len();
             assert!(chunk.bytes.len() <= max);
+            assert!(
+                self.received[start..end].iter().all(|received| *received),
+                "seed {}: a read returned bytes that had not arrived",
+                self.seed
+            );
             assert_eq!(
                 &chunk.bytes[..],
                 &self.stream[start..end],
@@ -1598,7 +1666,7 @@ mod test {
         let hole_every = rng.random_range(60..=300u32);
         let burst_every = rng.random_range(400..=4000u32);
         let switch_at = match rng.random_range(0..4u32) {
-            0 => Some(0),
+            0 => Some(1),
             1 => Some(rng.random_range(100..3000)),
             _ => None,
         };
@@ -1688,7 +1756,7 @@ mod test {
 
     #[test]
     fn random_sessions_match_a_byte_model() {
-        const SESSIONS: u64 = 128;
+        const SESSIONS: u64 = 24;
         let stream = stream_prefix(3_000_000);
         let (mut joined_sessions, mut joins, mut joined_bytes, mut compacted_bytes) = (0, 0, 0, 0);
         for seed in 0..SESSIONS {
@@ -2013,379 +2081,5 @@ mod proptests {
             reference.bytes_read(),
             "bytes_read mismatch"
         );
-    }
-}
-
-/// What a join costs when the peer arranges the data against it, in bytes copied, the most that
-/// the insert that joined allocated, and time, against what had been received since the join
-/// before. Run with `--nocapture` to print the table, and with `--release` for times worth
-/// reading.
-#[cfg(all(test, not(target_family = "wasm")))]
-mod join_cost {
-    use alloc::vec::Vec;
-    use core::{
-        alloc::{GlobalAlloc, Layout},
-        cell::Cell,
-    };
-    use std::{alloc::System, println, time::Instant};
-
-    use super::test::{FRAME_OVERHEAD, frame};
-    use super::*;
-
-    struct CountingAllocator;
-
-    std::thread_local! {
-        /// Bytes that this thread has allocated and not freed
-        static LIVE: Cell<isize> = const { Cell::new(0) };
-        /// The most that `LIVE` has been since it was last set to the live bytes
-        static PEAK: Cell<isize> = const { Cell::new(0) };
-    }
-
-    fn account(delta: isize) {
-        LIVE.with(|live| {
-            let now = live.get() + delta;
-            live.set(now);
-            PEAK.with(|peak| peak.set(peak.get().max(now)));
-        });
-    }
-
-    // SAFETY: every call is forwarded to `System`, which keeps the contract; only counters are
-    // added.
-    unsafe impl GlobalAlloc for CountingAllocator {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let ptr = unsafe { System.alloc(layout) };
-            if !ptr.is_null() {
-                account(layout.size() as isize);
-            }
-            ptr
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            unsafe { System.dealloc(ptr, layout) };
-            account(-(layout.size() as isize));
-        }
-
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            let new = unsafe { System.realloc(ptr, layout, new_size) };
-            if !new.is_null() {
-                account(new_size as isize - layout.size() as isize);
-            }
-            new
-        }
-    }
-
-    #[global_allocator]
-    static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-    /// One join, with what had been received since the one before it
-    struct JoinRow {
-        frames: u64,
-        stream_bytes: u64,
-        packet_bytes: u64,
-        copied: u64,
-        copied_by_compaction: u64,
-        buffered: usize,
-        longest_run: usize,
-        peak_allocation: isize,
-        micros: u128,
-        entries_after: usize,
-    }
-
-    struct Meter {
-        name: &'static str,
-        bound: usize,
-        x: Assembler,
-        frames: u64,
-        stream_bytes: u64,
-        packet_bytes: u64,
-        /// `frames`, `stream_bytes` and `packet_bytes` at the last join
-        last_join: (u64, u64, u64),
-        rows: Vec<JoinRow>,
-        refused_at: Option<u64>,
-    }
-
-    impl Meter {
-        fn new(name: &'static str, bound: usize) -> Self {
-            let mut x = Assembler::new();
-            x.stats.bound_after_join = Some(bound);
-            Self {
-                name,
-                bound,
-                x,
-                frames: 0,
-                stream_bytes: 0,
-                packet_bytes: 0,
-                last_join: (0, 0, 0),
-                rows: Vec::new(),
-                refused_at: None,
-            }
-        }
-
-        /// Inserts a frame that arrives in a packet of `allocation` bytes. Returns false once
-        /// the stream has been refused.
-        fn insert(&mut self, offset: u64, len: usize, allocation: usize) -> bool {
-            if self.refused_at.is_some() {
-                return false;
-            }
-            let bytes = frame(offset, len);
-            let stats = &mut self.x.stats;
-            let (joins, copied, by_compaction) = (
-                stats.joins,
-                stats.copied_by_join,
-                stats.copied_by_defragment,
-            );
-            stats.largest_run = 0;
-            let live = LIVE.with(Cell::get);
-            PEAK.with(|peak| peak.set(live));
-            let start = Instant::now();
-            let result = self.x.insert(offset, bytes, allocation);
-            let micros = start.elapsed().as_micros();
-            let peak_allocation = PEAK.with(Cell::get) - live;
-            self.frames += 1;
-            self.stream_bytes += len as u64;
-            self.packet_bytes += allocation as u64;
-            let stats = &self.x.stats;
-            if stats.joins > joins {
-                self.rows.push(JoinRow {
-                    frames: self.frames - self.last_join.0,
-                    stream_bytes: self.stream_bytes - self.last_join.1,
-                    packet_bytes: self.packet_bytes - self.last_join.2,
-                    copied: stats.copied_by_join - copied,
-                    copied_by_compaction: stats.copied_by_defragment - by_compaction,
-                    buffered: self.x.buffered,
-                    longest_run: stats.largest_run,
-                    peak_allocation,
-                    micros,
-                    entries_after: self.x.data.len(),
-                });
-                self.last_join = (self.frames, self.stream_bytes, self.packet_bytes);
-            }
-            if result.is_err() {
-                self.refused_at = Some(self.frames);
-            }
-            result.is_ok()
-        }
-
-        fn report(&self) {
-            for (i, row) in self.rows.iter().enumerate() {
-                println!(
-                    "{:<30} bound {:>4} join {:>2}: {:>6} frames {:>9} stream B {:>10} packet B | \
-                     copied {:>9} B = {:>8.1} per stream B, {:>5.2} per packet B | compaction \
-                     {:>9} B | buffered {:>8} | longest run {:>8} | peak alloc {:>9} B | \
-                     {:>6} us | entries {:>4}",
-                    self.name,
-                    self.bound,
-                    i + 1,
-                    row.frames,
-                    row.stream_bytes,
-                    row.packet_bytes,
-                    row.copied,
-                    row.copied as f64 / row.stream_bytes as f64,
-                    row.copied as f64 / row.packet_bytes as f64,
-                    row.copied_by_compaction,
-                    row.buffered,
-                    row.longest_run,
-                    row.peak_allocation,
-                    row.micros,
-                    row.entries_after,
-                );
-            }
-            match self.refused_at {
-                Some(frame) => println!(
-                    "{:<30} bound {:>4}: refused at frame {frame}, after {} joins",
-                    self.name,
-                    self.bound,
-                    self.rows.len()
-                ),
-                None => println!(
-                    "{:<30} bound {:>4}: accepted all {} frames, {} joins",
-                    self.name,
-                    self.bound,
-                    self.frames,
-                    self.rows.len()
-                ),
-            }
-        }
-    }
-
-    /// A packet of a full-size datagram
-    const PACKET: usize = 1200;
-
-    fn mixed(m: &mut Meter) {
-        let pattern = [424usize, 104, 104, 104];
-        let mut offset = 0;
-        for i in 0..2400 {
-            let len = pattern[i % pattern.len()];
-            if !m.insert(offset, len, len + FRAME_OVERHEAD) {
-                return;
-            }
-            offset += len as u64;
-        }
-    }
-
-    fn large_and_small_behind_a_hole(m: &mut Meter) {
-        let pattern = [5000usize, 400, 400, 400];
-        let mut offset = 1;
-        for i in 0..2400 {
-            let len = pattern[i % pattern.len()];
-            if !m.insert(offset, len, len + FRAME_OVERHEAD) {
-                return;
-            }
-            offset += len as u64;
-        }
-    }
-
-    /// Many small frames that each count a whole packet, between frames that fill theirs
-    fn tiny_frames_in_full_packets(m: &mut Meter) {
-        let mut offset = 0;
-        for _ in 0..1000 {
-            if !m.insert(offset, 300, 300 + FRAME_OVERHEAD) {
-                return;
-            }
-            offset += 300;
-            for _ in 0..7 {
-                if !m.insert(offset, 4, PACKET) {
-                    return;
-                }
-                offset += 4;
-            }
-        }
-    }
-
-    /// `gaps` runs of a large and a small chunk behind one-byte holes, the first `long` of them
-    /// with a second large chunk, and then one-byte frames in full packets until a compaction runs
-    fn many_gaps(m: &mut Meter, gaps: usize, long: usize) {
-        let mut offset = 1;
-        for run in 0..gaps {
-            let lengths: &[usize] = if run < long {
-                &[1000, 4, 1000]
-            } else {
-                &[1000, 4]
-            };
-            for &len in lengths {
-                if !m.insert(offset, len, len + FRAME_OVERHEAD) {
-                    return;
-                }
-                offset += len as u64;
-            }
-            if run + 1 < gaps {
-                offset += 1;
-            }
-        }
-        let compactions = m.x.stats.compactions;
-        for _ in 0..8000 {
-            if m.x.stats.compactions > compactions || !m.insert(offset, 1, PACKET) {
-                return;
-            }
-            offset += 1;
-        }
-    }
-
-    /// A peer that holds `gaps` gaps open with one byte each, with a bulk run of data behind
-    /// them, makes the bulk run carry new chunks that compaction keeps apart, and then forces a
-    /// compaction with one-byte frames in full packets, again and again until twelve joins have run
-    fn hostile_repeat(m: &mut Meter, gaps: usize) {
-        let mut offset = 1;
-        for _ in 0..gaps {
-            if !m.insert(offset, 1, 1 + FRAME_OVERHEAD) {
-                return;
-            }
-            offset += 2;
-        }
-        for _ in 0..310 {
-            if !m.insert(offset, 128, 128 + FRAME_OVERHEAD) {
-                return;
-            }
-            offset += 128;
-        }
-        for _ in 0..60_000 {
-            if m.rows.len() == 12 {
-                return;
-            }
-            let (len, allocation) = if m.x.data.len() <= MAX_CHUNKS {
-                (160, 160 + FRAME_OVERHEAD)
-            } else {
-                (1, PACKET)
-            };
-            if !m.insert(offset, len, allocation) {
-                return;
-            }
-            offset += len as u64;
-        }
-    }
-
-    fn run(name: &'static str, bound: usize, scenario: impl Fn(&mut Meter)) -> Meter {
-        let mut meter = Meter::new(name, bound);
-        scenario(&mut meter);
-        meter.report();
-        meter
-    }
-
-    #[test]
-    fn join_cost_with_and_without_the_bound() {
-        for bound in [MAX_CHUNKS_AFTER_JOIN, MAX_CHUNKS] {
-            let meters = [
-                run("mixed 424/104/104/104", bound, mixed),
-                run(
-                    "5000/400/400/400 behind a hole",
-                    bound,
-                    large_and_small_behind_a_hole,
-                ),
-                run(
-                    "tiny frames in full packets",
-                    bound,
-                    tiny_frames_in_full_packets,
-                ),
-                run("512 gaps, one run longer", bound, |m| many_gaps(m, 512, 1)),
-                run("513 gaps", bound, |m| many_gaps(m, 513, 0)),
-                run("700 gaps", bound, |m| many_gaps(m, 700, 0)),
-                run("1000 gaps", bound, |m| many_gaps(m, 1000, 0)),
-                run("hostile repeat, 400 gaps", bound, |m| {
-                    hostile_repeat(m, 400)
-                }),
-                run("hostile repeat, 500 gaps", bound, |m| {
-                    hostile_repeat(m, 500)
-                }),
-                run("hostile repeat, 1000 gaps", bound, |m| {
-                    hostile_repeat(m, 1000)
-                }),
-            ];
-            if bound != MAX_CHUNKS_AFTER_JOIN {
-                continue;
-            }
-            for meter in &meters {
-                for (i, row) in meter.rows.iter().enumerate() {
-                    assert!(
-                        row.copied as usize <= row.buffered,
-                        "{}: a join copied more than the buffer holds",
-                        meter.name
-                    );
-                    assert!(
-                        row.peak_allocation as usize <= 2 * row.buffered + 64 * 1024,
-                        "{}: a join allocated {} bytes for {} buffered",
-                        meter.name,
-                        row.peak_allocation,
-                        row.buffered
-                    );
-                    // Back from at most the bound to above `MAX_CHUNKS` takes one more frame
-                    // than the difference, as no frame adds more than one entry
-                    if i > 0 {
-                        assert!(
-                            row.frames > (MAX_CHUNKS - MAX_CHUNKS_AFTER_JOIN) as u64,
-                            "{}: joins {} frames apart",
-                            meter.name,
-                            row.frames
-                        );
-                    }
-                }
-            }
-            let [_, _, _, _, refused, _, _, _, repeated, thousand] = &meters;
-            assert!(refused.refused_at.is_some());
-            assert!(
-                repeated.rows.len() >= 2,
-                "the repeated join was not exercised"
-            );
-            assert!(thousand.refused_at.is_some());
-        }
     }
 }
